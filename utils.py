@@ -1,4 +1,3 @@
-"""Utility functions for MORSE pipeline."""
 import os
 import random
 import numpy as np
