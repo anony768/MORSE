@@ -2,13 +2,12 @@ import os
 import sys
 import pickle
 import torch
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 
 sys.path.insert(0, os.path.dirname(__file__))
 import config as C
-from models import (TrajMAE, RewardEnsemble, num_masked_states, sample_masked_states,
+from models import (TrajMAE, RewardEnsemble, sample_masked_states,
                     extract_transitions_from_trajectory, extract_transitions_unlabeled)
 from utils import set_seed, get_device, setup_logging, save_metrics
 
@@ -37,13 +36,10 @@ def to_tensor(x, device):
 
 
 def reconstruction_loss(mae, trajectory, mask_ratio, device):
-    mask_indices = sample_masked_states(trajectory, mask_ratio)
-    if len(mask_indices) == 0:
-        return None
-    token_emb = mae.embed_trajectory(trajectory, mask_indices, device)
-    recon = mae(token_emb, mask_indices)
-    target = torch.stack([to_tensor(trajectory[i][0], device) for i in mask_indices])
-    return F.mse_loss(recon, target)
+    masked_positions = sample_masked_states(trajectory, mask_ratio)
+    token_emb, positions, targets = mae.embed_trajectory(trajectory, masked_positions, device)
+    recon = mae(token_emb, positions)
+    return sum(((targets[t] - recon[t]) ** 2).sum(dim=-1).mean() for t in targets)
 
 
 def insert_predicted_rewards(ensemble, trajectory, device):
@@ -83,21 +79,13 @@ def train_step(mae, ensemble, labeled_batch, unlabeled_batch, mae_opt, ensemble_
         sa = torch.cat([to_tensor(states, device), to_tensor(actions, device),
                         to_tensor(next_states, device)], dim=1)
         reward_losses.append(ensemble.individual_losses(sa, to_tensor(rewards, device)))
-
-        loss = reconstruction_loss(mae, trajectory, mask_ratio, device)
-        if loss is not None:
-            labeled_recon.append(loss)
+        labeled_recon.append(reconstruction_loss(mae, trajectory, mask_ratio, device))
 
     for trajectory in unlabeled_batch:
-        n_states = sum(1 for _, t in trajectory if t == "state")
-        if n_states < 2 or num_masked_states(n_states, mask_ratio) == 0:
-            continue
         augmented_traj = insert_predicted_rewards(ensemble, trajectory, device)
         if augmented_traj is None:
             continue
-        loss = reconstruction_loss(mae, augmented_traj, mask_ratio, device)
-        if loss is not None:
-            unlabeled_recon.append(loss)
+        unlabeled_recon.append(reconstruction_loss(mae, augmented_traj, mask_ratio, device))
 
     terms = [torch.stack(losses).mean()
              for losses in (reward_losses, labeled_recon, unlabeled_recon) if losses]
