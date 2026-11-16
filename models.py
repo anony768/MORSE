@@ -1,15 +1,8 @@
-"""MORSE Model Definitions - All neural network architectures."""
 import torch
 import torch.nn as nn
 import random
 
-# ================================================================
-#  1. VAE for Urban State Compression
-# ================================================================
 class VAE(nn.Module):
-    """Variational Autoencoder with KL divergence regularization.
-    L_Compress = ||S - S_hat||^2 + beta * KL(q(s|S) || p(s))
-    """
     def __init__(self, input_dim=125, hidden_dim=64, latent_dim=10):
         super().__init__()
         self.fc_hidden = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU())
@@ -37,7 +30,6 @@ class VAE(nn.Module):
         return self.decode(z), mu, logvar
 
     def encode_deterministic(self, x):
-        """For inference: use mu as the latent representation."""
         mu, _ = self.encode(x)
         return mu
 
@@ -48,11 +40,7 @@ class VAE(nn.Module):
         return recon_loss + beta * kl_loss, recon_loss, kl_loss
 
 
-# ================================================================
-#  2. Reward Ensemble Network
-# ================================================================
 class RewardModel(nn.Module):
-    """Single reward predictor: (s, a, s') -> r"""
     def __init__(self, input_dim=21, hidden_dim=64):
         super().__init__()
         self.net = nn.Sequential(
@@ -65,9 +53,6 @@ class RewardModel(nn.Module):
 
 
 class RewardEnsemble(nn.Module):
-    """Ensemble of m reward models with trimmed mean aggregation.
-    Remove highest and lowest, average the rest.
-    """
     def __init__(self, n_models=7, input_dim=21, hidden_dim=64):
         super().__init__()
         self.n_models = n_models
@@ -76,15 +61,13 @@ class RewardEnsemble(nn.Module):
         ])
 
     def forward(self, x):
-        """Trimmed mean: remove max and min, average the rest."""
-        outputs = torch.stack([m(x) for m in self.models], dim=0)  # [m, B, 1]
+        outputs = torch.stack([m(x) for m in self.models], dim=0)
         if self.n_models >= 5:
             sorted_out, _ = torch.sort(outputs, dim=0)
-            return sorted_out[1:-1].mean(dim=0)  # [B, 1]
+            return sorted_out[1:-1].mean(dim=0)
         return outputs.mean(dim=0)
 
     def individual_losses(self, x, target):
-        """Compute MSE loss for each model independently."""
         total = 0.0
         for m in self.models:
             pred = m(x).squeeze(-1)
@@ -92,9 +75,6 @@ class RewardEnsemble(nn.Module):
         return total
 
 
-# ================================================================
-#  3. Trajectory Masked Autoencoder - TrajMAE
-# ================================================================
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, embed_dim, num_heads, ff_dim, dropout=0.1):
         super().__init__()
@@ -114,65 +94,85 @@ class TransformerEncoderLayer(nn.Module):
         return src
 
 
+TOKEN_TYPE_IDS = {"state": 0, "action": 1, "reward": 2}
+
+
+def _as_float_tensor(value, device):
+    if isinstance(value, torch.Tensor):
+        return value.to(device=device, dtype=torch.float32)
+    return torch.tensor(value, dtype=torch.float32, device=device)
+
+
 class TrajMAE(nn.Module):
-    """Trajectory Masked AutoEncoder.
-    Encodes trajectory tokens (state/action/reward) with a Transformer,
-    reconstructs masked state tokens.
-    """
-    def __init__(self, embed_dim=32, num_heads=4, ff_dim=64, num_layers=2, state_dim=10):
+    def __init__(self, embed_dim=32, num_heads=4, ff_dim=64, num_layers=2, state_dim=10,
+                 max_timesteps=128):
         super().__init__()
         self.embed_dim = embed_dim
         self.state_dim = state_dim
+        self.max_timesteps = max_timesteps
 
-        self.type_embed = nn.Embedding(3, embed_dim)  # 0=state, 1=action, 2=reward
+        self.type_embed = nn.Embedding(3, embed_dim)
+        self.time_embed = nn.Embedding(max_timesteps, embed_dim)
         self.state_embed = nn.Linear(state_dim, embed_dim)
         self.action_embed = nn.Linear(1, embed_dim)
         self.reward_embed = nn.Linear(1, embed_dim)
+        self.mask_token = nn.Parameter(torch.zeros(1, embed_dim))
+        nn.init.normal_(self.mask_token, std=0.02)
 
         self.encoder = nn.ModuleList([
             TransformerEncoderLayer(embed_dim, num_heads, ff_dim)
             for _ in range(num_layers)
         ])
 
-        self.decoder = nn.Sequential(
+        self.decoder_attn = TransformerEncoderLayer(embed_dim, num_heads, ff_dim)
+        self.decoder_head = nn.Sequential(
             nn.Linear(embed_dim, ff_dim), nn.ReLU(), nn.Linear(ff_dim, state_dim)
         )
 
-    def embed_token(self, value, token_type, device):
-        """Embed a single token. value must be a tensor for gradient flow."""
-        type_idx = {"state": 0, "action": 1, "reward": 2}[token_type]
-        type_emb = self.type_embed(torch.tensor([type_idx], device=device))
+    def embed_trajectory(self, trajectory, masked_positions, device):
+        masked = set(masked_positions)
+        positions = {"state": [], "action": [], "reward": []}
+        values = {"state": [], "action": [], "reward": []}
+        type_ids, timesteps = [], []
+        step = -1
+        for i, (val, t) in enumerate(trajectory):
+            if t == "state":
+                step += 1
+            type_ids.append(TOKEN_TYPE_IDS[t])
+            timesteps.append(min(max(step, 0), self.max_timesteps - 1))
+            if t == "state" and i in masked:
+                continue
+            positions[t].append(i)
+            values[t].append(val)
 
-        if token_type == "state":
-            val_emb = self.state_embed(value.unsqueeze(0) if value.dim() == 1 else value)
-        elif token_type == "action":
-            v = value if isinstance(value, torch.Tensor) else torch.tensor([value], dtype=torch.float32, device=device)
-            val_emb = self.action_embed(v.view(1, 1))
-        else:  # reward
-            v = value if isinstance(value, torch.Tensor) else torch.tensor([value], dtype=torch.float32, device=device)
-            val_emb = self.reward_embed(v.view(1, 1))
-        return type_emb + val_emb  # [1, embed_dim]
+        value_emb = self.mask_token.expand(len(trajectory), -1).clone()
+        if positions["state"]:
+            s = torch.stack([_as_float_tensor(v, device) for v in values["state"]])
+            value_emb[positions["state"]] = self.state_embed(s)
+        if positions["action"]:
+            a = torch.stack([_as_float_tensor(v, device).reshape(()) for v in values["action"]])
+            value_emb[positions["action"]] = self.action_embed(a.unsqueeze(-1))
+        if positions["reward"]:
+            r = torch.stack([_as_float_tensor(v, device).reshape(()) for v in values["reward"]])
+            value_emb[positions["reward"]] = self.reward_embed(r.unsqueeze(-1))
+
+        type_emb = self.type_embed(torch.tensor(type_ids, device=device))
+        time_emb = self.time_embed(torch.tensor(timesteps, device=device))
+        return (value_emb + type_emb + time_emb).unsqueeze(1)
 
     def forward(self, token_embeddings, mask_indices):
-        """
-        token_embeddings: [seq_len, 1, embed_dim]
-        mask_indices: list of int positions where states were masked
-        Returns: reconstructed states [n_masked, state_dim]
-        """
         x = token_embeddings
         for layer in self.encoder:
             x = layer(x)
+        x = self.decoder_attn(x)
 
         if len(mask_indices) == 0:
             return torch.zeros(0, self.state_dim, device=x.device)
 
-        masked_features = x[mask_indices, 0, :]  # [n_masked, embed_dim]
-        return self.decoder(masked_features)  # [n_masked, state_dim]
+        masked_features = x[mask_indices, 0, :]
+        return self.decoder_head(masked_features)
 
 
-# ================================================================
-#  4. IQL Networks
-# ================================================================
 class QNetwork(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_size=256):
         super().__init__()
@@ -198,7 +198,6 @@ class ValueNetwork(nn.Module):
 
 
 class PolicyNetwork(nn.Module):
-    """Gaussian policy for continuous actions."""
     def __init__(self, state_dim, action_dim, hidden_size=256):
         super().__init__()
         self.net = nn.Sequential(
@@ -224,29 +223,17 @@ class PolicyNetwork(nn.Module):
         return -0.5 * (((action - mean) / std) ** 2 + 2 * log_std + 1.8378770664093453)
 
 
-# ================================================================
-#  Helper functions
-# ================================================================
-def mask_trajectory_states(trajectory, mask_ratio=0.3):
-    """Mask a proportion of state tokens in a trajectory.
-    Returns (mask_positions_bool, masked_trajectory).
-    """
-    state_positions = [i for i, (_, t) in enumerate(trajectory) if t == "state"]
-    n_to_mask = max(1, int(len(state_positions) * mask_ratio))
-    chosen = set(random.sample(state_positions, min(n_to_mask, len(state_positions))))
+def num_masked_states(n_states, mask_ratio):
+    return max(0, min(n_states, int(round(n_states * mask_ratio))))
 
-    mask_bool = [i in chosen for i in range(len(trajectory))]
-    masked_traj = []
-    for i, (val, t) in enumerate(trajectory):
-        if t == "state" and i in chosen:
-            masked_traj.append(([0.0] * len(val), t))
-        else:
-            masked_traj.append((val, t))
-    return mask_bool, masked_traj
+
+def sample_masked_states(trajectory, mask_ratio=0.3):
+    state_positions = [i for i, (_, t) in enumerate(trajectory) if t == "state"]
+    n_to_mask = num_masked_states(len(state_positions), mask_ratio)
+    return sorted(random.sample(state_positions, n_to_mask))
 
 
 def extract_transitions_from_trajectory(trajectory):
-    """Extract (s, a, s', r) tuples from a [value, type] trajectory."""
     states, actions, next_states, rewards = [], [], [], []
     i = 0
     while i < len(trajectory) - 2:
@@ -265,7 +252,6 @@ def extract_transitions_from_trajectory(trajectory):
 
 
 def extract_transitions_unlabeled(trajectory):
-    """Extract (s, a, s') from unlabeled trajectory (no rewards)."""
     states, actions, next_states = [], [], []
     i = 0
     while i < len(trajectory) - 1:
