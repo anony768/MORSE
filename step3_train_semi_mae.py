@@ -1,18 +1,15 @@
-"""Step 3: Mask-Empowered Reward Learning.
-Joint semi-supervised training of TrajMAE + Reward Ensemble.
-"""
 import os
 import sys
 import pickle
-import random
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 
 sys.path.insert(0, os.path.dirname(__file__))
 import config as C
-from models import TrajMAE, RewardEnsemble, mask_trajectory_states, extract_transitions_from_trajectory, extract_transitions_unlabeled
+from models import (TrajMAE, RewardEnsemble, num_masked_states, sample_masked_states,
+                    extract_transitions_from_trajectory, extract_transitions_unlabeled)
 from utils import set_seed, get_device, setup_logging, save_metrics
 
 
@@ -29,157 +26,90 @@ def collate_fn(batch):
     return batch
 
 
-def train_step_labeled(mae, ensemble, trajectories, mae_opt, ensemble_opt, mask_ratio, device):
-    """Labeled data: supervised reward loss + MAE reconstruction."""
+def cycle(loader):
+    while True:
+        for batch in loader:
+            yield batch
+
+
+def to_tensor(x, device):
+    return torch.tensor(x, dtype=torch.float32, device=device)
+
+
+def reconstruction_loss(mae, trajectory, mask_ratio, device):
+    mask_indices = sample_masked_states(trajectory, mask_ratio)
+    if len(mask_indices) == 0:
+        return None
+    token_emb = mae.embed_trajectory(trajectory, mask_indices, device)
+    recon = mae(token_emb, mask_indices)
+    target = torch.stack([to_tensor(trajectory[i][0], device) for i in mask_indices])
+    return F.mse_loss(recon, target)
+
+
+def insert_predicted_rewards(ensemble, trajectory, device):
+    states, actions, next_states = extract_transitions_unlabeled(trajectory)
+    if len(states) == 0:
+        return None
+    sa = torch.cat([to_tensor(states, device), to_tensor(actions, device),
+                    to_tensor(next_states, device)], dim=1)
+    pred_rewards = ensemble(sa).squeeze(-1)
+
+    augmented_traj = []
+    reward_idx = 0
+    for val, t in trajectory:
+        if t == "state":
+            augmented_traj.append((val, t))
+        elif t == "action":
+            augmented_traj.append((val, t))
+            if reward_idx < len(pred_rewards):
+                augmented_traj.append((pred_rewards[reward_idx], "reward"))
+                reward_idx += 1
+    return augmented_traj
+
+
+def train_step(mae, ensemble, labeled_batch, unlabeled_batch, mae_opt, ensemble_opt,
+               mask_ratio, device):
     mae.train()
     ensemble.train()
     mae_opt.zero_grad()
     ensemble_opt.zero_grad()
 
-    total_reward_loss = 0.0
-    total_mae_loss = 0.0
-    mse = nn.MSELoss()
-    valid_count = 0
+    reward_losses, labeled_recon, unlabeled_recon = [], [], []
 
-    for trajectory in trajectories:
-        # Reward ensemble supervised loss
+    for trajectory in labeled_batch:
         states, actions, next_states, rewards = extract_transitions_from_trajectory(trajectory)
         if len(states) == 0:
             continue
-        valid_count += 1
+        sa = torch.cat([to_tensor(states, device), to_tensor(actions, device),
+                        to_tensor(next_states, device)], dim=1)
+        reward_losses.append(ensemble.individual_losses(sa, to_tensor(rewards, device)))
 
-        s_t = torch.tensor(states, dtype=torch.float32, device=device)
-        a_t = torch.tensor(actions, dtype=torch.float32, device=device)
-        ns_t = torch.tensor(next_states, dtype=torch.float32, device=device)
-        r_t = torch.tensor(rewards, dtype=torch.float32, device=device)
-        sa = torch.cat([s_t, a_t, ns_t], dim=1)
+        loss = reconstruction_loss(mae, trajectory, mask_ratio, device)
+        if loss is not None:
+            labeled_recon.append(loss)
 
-        reward_loss = ensemble.individual_losses(sa, r_t)
-        total_reward_loss += reward_loss.item()
-
-        # MAE reconstruction loss
-        mask_bool, masked_traj = mask_trajectory_states(trajectory, mask_ratio)
-        embeddings = []
-        for i, (val, t) in enumerate(masked_traj):
-            v = torch.tensor(val, dtype=torch.float32, device=device) if not isinstance(val, torch.Tensor) else val
-            embeddings.append(mae.embed_token(v, t, device))
-        if len(embeddings) == 0:
-            reward_loss.backward()
+    for trajectory in unlabeled_batch:
+        n_states = sum(1 for _, t in trajectory if t == "state")
+        if n_states < 2 or num_masked_states(n_states, mask_ratio) == 0:
             continue
-        token_emb = torch.cat(embeddings, dim=0).unsqueeze(1)  # [seq, 1, embed]
-        mask_indices = [i for i, m in enumerate(mask_bool) if m and trajectory[i][1] == "state"]
-
-        if len(mask_indices) == 0:
-            reward_loss.backward()
+        augmented_traj = insert_predicted_rewards(ensemble, trajectory, device)
+        if augmented_traj is None:
             continue
+        loss = reconstruction_loss(mae, augmented_traj, mask_ratio, device)
+        if loss is not None:
+            unlabeled_recon.append(loss)
 
-        recon = mae(token_emb, mask_indices)
-        gt = torch.tensor(
-            [trajectory[i][0] for i in mask_indices],
-            dtype=torch.float32, device=device
-        )
-        mae_loss = mse(recon, gt)
-        total_mae_loss += mae_loss.item()
-
-        loss = reward_loss + mae_loss
-        loss.backward()
-
-    if valid_count > 0:
+    terms = [torch.stack(losses).mean()
+             for losses in (reward_losses, labeled_recon, unlabeled_recon) if losses]
+    if terms:
+        total_loss = sum(terms)
+        total_loss.backward()
         mae_opt.step()
         ensemble_opt.step()
-    return (total_reward_loss / max(valid_count, 1),
-            total_mae_loss / max(valid_count, 1))
 
-
-def train_step_unlabeled(mae, ensemble, trajectories, mae_opt, ensemble_opt, mask_ratio, device):
-    """Unlabeled data: ensemble predicts rewards (differentiable), MAE reconstructs.
-    Gradients flow through both MAE AND ensemble.
-    """
-    mae.train()
-    ensemble.train()  # KEY: ensemble is updated for unlabeled too
-    mae_opt.zero_grad()
-    ensemble_opt.zero_grad()
-
-    total_mae_loss = 0.0
-    mse = nn.MSELoss()
-    valid_count = 0
-
-    for trajectory in trajectories:
-        states, actions, next_states = extract_transitions_unlabeled(trajectory)
-        if len(states) == 0:
-            continue
-
-        s_t = torch.tensor(states, dtype=torch.float32, device=device)
-        a_t = torch.tensor(actions, dtype=torch.float32, device=device)
-        ns_t = torch.tensor(next_states, dtype=torch.float32, device=device)
-        sa = torch.cat([s_t, a_t, ns_t], dim=1)
-
-        # Predict rewards (DIFFERENTIABLE - no detach)
-        pred_rewards = ensemble(sa).squeeze(-1)  # [n_transitions]
-
-        # Rebuild the trajectory with predicted rewards after each action that
-        # has a next state; placeholder reward tokens in the input are dropped.
-        augmented_traj = []
-        reward_idx = 0
-        for val, t in trajectory:
-            if t == "state":
-                augmented_traj.append((val, t))
-            elif t == "action":
-                augmented_traj.append((val, t))
-                if reward_idx < len(pred_rewards):
-                    augmented_traj.append((pred_rewards[reward_idx], "reward"))
-                    reward_idx += 1
-
-        # MAE: mask and reconstruct
-        state_positions = [i for i, (_, t) in enumerate(augmented_traj) if t == "state"]
-        if len(state_positions) < 2:
-            continue
-        valid_count += 1
-
-        n_mask = max(1, int(len(state_positions) * mask_ratio))
-        chosen = set(random.sample(state_positions, min(n_mask, len(state_positions))))
-        mask_indices = sorted(chosen)
-
-        embeddings = []
-        for i, (val, t) in enumerate(augmented_traj):
-            if t == "state" and i in chosen:
-                zero_val = torch.zeros(C.MAE_STATE_DIM, device=device)
-                embeddings.append(mae.embed_token(zero_val, t, device))
-            else:
-                if isinstance(val, torch.Tensor):
-                    embeddings.append(mae.embed_token(val, t, device))
-                else:
-                    v = torch.tensor(val if isinstance(val, list) else [val],
-                                     dtype=torch.float32, device=device)
-                    embeddings.append(mae.embed_token(v, t, device))
-
-        if len(embeddings) == 0:
-            continue
-
-        token_emb = torch.cat(embeddings, dim=0).unsqueeze(1)
-        recon = mae(token_emb, mask_indices)
-
-        gt_states = []
-        for mi in mask_indices:
-            if mi < len(augmented_traj) and augmented_traj[mi][1] == "state":
-                val = augmented_traj[mi][0]
-                if isinstance(val, torch.Tensor):
-                    gt_states.append(val)
-                else:
-                    gt_states.append(torch.tensor(val, dtype=torch.float32, device=device))
-
-        if len(gt_states) == 0:
-            continue
-
-        gt = torch.stack(gt_states)
-        mae_loss = mse(recon, gt)
-        total_mae_loss += mae_loss.item()
-        mae_loss.backward()
-
-    if valid_count > 0:
-        mae_opt.step()
-        ensemble_opt.step()
-    return total_mae_loss / max(valid_count, 1)
+    def avg(losses):
+        return sum(l.item() for l in losses) / len(losses) if losses else 0.0
+    return avg(reward_losses), avg(labeled_recon), avg(unlabeled_recon)
 
 
 def train_semi_mae(task, gpu_id, seed=42):
@@ -199,47 +129,49 @@ def train_semi_mae(task, gpu_id, seed=42):
     with open(unlabeled_path, 'rb') as f:
         unlabeled_data = pickle.load(f)
     logger.info(f"Labeled trajectories: {len(labeled_data)}, Unlabeled: {len(unlabeled_data)}")
+    if len(labeled_data) == 0:
+        raise ValueError(f"No labeled trajectories for {task}")
 
     labeled_loader = DataLoader(
         TrajectoryDataset(labeled_data), batch_size=C.MAE_BATCH_SIZE,
         shuffle=True, collate_fn=collate_fn
     )
-    unlabeled_loader = DataLoader(
-        TrajectoryDataset(unlabeled_data), batch_size=C.MAE_BATCH_SIZE,
-        shuffle=True, collate_fn=collate_fn
-    )
+    unlabeled_loader = None
+    if len(unlabeled_data) > 0:
+        unlabeled_loader = DataLoader(
+            TrajectoryDataset(unlabeled_data), batch_size=C.MAE_BATCH_SIZE,
+            shuffle=True, collate_fn=collate_fn
+        )
 
     mae = TrajMAE(C.MAE_EMBED_DIM, C.MAE_NUM_HEADS, C.MAE_FF_DIM,
-                   C.MAE_NUM_LAYERS, C.MAE_STATE_DIM).to(device)
+                   C.MAE_NUM_LAYERS, C.MAE_STATE_DIM, C.MAE_MAX_TIMESTEPS).to(device)
     ensemble = RewardEnsemble(C.ENSEMBLE_N_MODELS, C.ENSEMBLE_INPUT_DIM,
                                C.ENSEMBLE_HIDDEN_DIM).to(device)
 
     mae_opt = optim.Adam(mae.parameters(), lr=C.MAE_LR)
     ensemble_opt = optim.Adam(ensemble.parameters(), lr=C.MAE_LR)
 
+    labeled_iter = cycle(labeled_loader)
+    steps_per_epoch = len(unlabeled_loader) if unlabeled_loader is not None else len(labeled_loader)
+    logger.info(f"Steps per epoch: {steps_per_epoch}, mask ratio: {C.MAE_MASK_RATIO}")
+
     history = {"reward_loss": [], "labeled_mae": [], "unlabeled_mae": []}
 
     for epoch in range(1, C.MAE_EPOCHS + 1):
-        # Labeled training
-        rl_total, ml_total, lc = 0, 0, 0
-        for batch in labeled_loader:
-            rl, ml = train_step_labeled(mae, ensemble, batch, mae_opt, ensemble_opt,
-                                        C.MAE_MASK_RATIO, device)
+        rl_total, ml_total, ul_total, n_steps = 0.0, 0.0, 0.0, 0
+        unlabeled_batches = unlabeled_loader if unlabeled_loader is not None else [[]] * steps_per_epoch
+        for unlabeled_batch in unlabeled_batches:
+            labeled_batch = next(labeled_iter)
+            rl, ml, ul = train_step(mae, ensemble, labeled_batch, unlabeled_batch,
+                                    mae_opt, ensemble_opt, C.MAE_MASK_RATIO, device)
             rl_total += rl
             ml_total += ml
-            lc += 1
-
-        # Unlabeled training
-        ul_total, uc = 0, 0
-        for batch in unlabeled_loader:
-            ul = train_step_unlabeled(mae, ensemble, batch, mae_opt, ensemble_opt,
-                                      C.MAE_MASK_RATIO, device)
             ul_total += ul
-            uc += 1
+            n_steps += 1
 
-        rl_avg = rl_total / max(lc, 1)
-        ml_avg = ml_total / max(lc, 1)
-        ul_avg = ul_total / max(uc, 1)
+        rl_avg = rl_total / max(n_steps, 1)
+        ml_avg = ml_total / max(n_steps, 1)
+        ul_avg = ul_total / max(n_steps, 1)
         history["reward_loss"].append(rl_avg)
         history["labeled_mae"].append(ml_avg)
         history["unlabeled_mae"].append(ul_avg)
