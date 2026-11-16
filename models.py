@@ -113,9 +113,11 @@ class TrajMAE(nn.Module):
 
         self.type_embed = nn.Embedding(3, embed_dim)
         self.time_embed = nn.Embedding(max_timesteps, embed_dim)
-        self.state_embed = nn.Linear(state_dim, embed_dim)
-        self.action_embed = nn.Linear(1, embed_dim)
-        self.reward_embed = nn.Linear(1, embed_dim)
+        self.value_embed = nn.ModuleDict({
+            "state": nn.Linear(state_dim, embed_dim),
+            "action": nn.Linear(1, embed_dim),
+            "reward": nn.Linear(1, embed_dim),
+        })
         self.mask_token = nn.Parameter(torch.zeros(1, embed_dim))
         nn.init.normal_(self.mask_token, std=0.02)
 
@@ -125,12 +127,14 @@ class TrajMAE(nn.Module):
         ])
 
         self.decoder_attn = TransformerEncoderLayer(embed_dim, num_heads, ff_dim)
-        self.decoder_head = nn.Sequential(
-            nn.Linear(embed_dim, ff_dim), nn.ReLU(), nn.Linear(ff_dim, state_dim)
-        )
+        self.decoder_head = nn.ModuleDict({
+            token_type: nn.Sequential(
+                nn.Linear(embed_dim, ff_dim), nn.ReLU(), nn.Linear(ff_dim, out_dim)
+            )
+            for token_type, out_dim in (("state", state_dim), ("action", 1), ("reward", 1))
+        })
 
     def embed_trajectory(self, trajectory, masked_positions, device):
-        masked = set(masked_positions)
         positions = {"state": [], "action": [], "reward": []}
         values = {"state": [], "action": [], "reward": []}
         type_ids, timesteps = [], []
@@ -140,37 +144,26 @@ class TrajMAE(nn.Module):
                 step += 1
             type_ids.append(TOKEN_TYPE_IDS[t])
             timesteps.append(min(max(step, 0), self.max_timesteps - 1))
-            if t == "state" and i in masked:
-                continue
             positions[t].append(i)
-            values[t].append(val)
+            values[t].append(_as_float_tensor(val, device).reshape(-1))
 
-        value_emb = self.mask_token.expand(len(trajectory), -1).clone()
-        if positions["state"]:
-            s = torch.stack([_as_float_tensor(v, device) for v in values["state"]])
-            value_emb[positions["state"]] = self.state_embed(s)
-        if positions["action"]:
-            a = torch.stack([_as_float_tensor(v, device).reshape(()) for v in values["action"]])
-            value_emb[positions["action"]] = self.action_embed(a.unsqueeze(-1))
-        if positions["reward"]:
-            r = torch.stack([_as_float_tensor(v, device).reshape(()) for v in values["reward"]])
-            value_emb[positions["reward"]] = self.reward_embed(r.unsqueeze(-1))
+        targets = {t: torch.stack(v) for t, v in values.items() if v}
+        value_emb = torch.zeros(len(trajectory), self.embed_dim, device=device)
+        for t, target in targets.items():
+            value_emb[positions[t]] = self.value_embed[t](target)
+        if len(masked_positions) > 0:
+            value_emb[list(masked_positions)] = self.mask_token
 
         type_emb = self.type_embed(torch.tensor(type_ids, device=device))
         time_emb = self.time_embed(torch.tensor(timesteps, device=device))
-        return (value_emb + type_emb + time_emb).unsqueeze(1)
+        return (value_emb + type_emb + time_emb).unsqueeze(1), positions, targets
 
-    def forward(self, token_embeddings, mask_indices):
+    def forward(self, token_embeddings, positions):
         x = token_embeddings
         for layer in self.encoder:
             x = layer(x)
-        x = self.decoder_attn(x)
-
-        if len(mask_indices) == 0:
-            return torch.zeros(0, self.state_dim, device=x.device)
-
-        masked_features = x[mask_indices, 0, :]
-        return self.decoder_head(masked_features)
+        x = self.decoder_attn(x).squeeze(1)
+        return {t: self.decoder_head[t](x[p]) for t, p in positions.items() if p}
 
 
 class QNetwork(nn.Module):
