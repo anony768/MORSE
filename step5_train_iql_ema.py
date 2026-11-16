@@ -1,6 +1,3 @@
-"""Step 5: IQL with Adaptive Knowledge Fusion.
-Two policies trained on labeled/relabeled data, fused via EMA every eta epochs.
-"""
 import os
 import sys
 import copy
@@ -17,7 +14,6 @@ from utils import set_seed, get_device, setup_logging, save_metrics
 
 
 class LatentTransitionDataset(Dataset):
-    """Dataset for 22-dim latent transitions: [s(10), a(1), r(1), s'(10)]."""
     def __init__(self, data):
         self.data = np.array(data, dtype=np.float32)
 
@@ -35,10 +31,8 @@ class LatentTransitionDataset(Dataset):
 
 def iql_update(q_net, q_opt, v_net, v_opt, pi_net, pi_opt,
                batch, gamma=0.99, tau=0.7, beta=3.0):
-    """IQL update (Kostrikov et al., 2021) with correct expectile regression."""
     states, actions, rewards, next_states = batch
 
-    # 1) Q-network: L_Q = E[(Q(s,a) - (r + gamma*V(s')))^2]
     with torch.no_grad():
         v_next = v_net(next_states).squeeze(-1)
         td_target = rewards.squeeze(-1) + gamma * v_next
@@ -51,12 +45,10 @@ def iql_update(q_net, q_opt, v_net, v_opt, pi_net, pi_opt,
     torch.nn.utils.clip_grad_norm_(q_net.parameters(), 1.0)
     q_opt.step()
 
-    # 2) V-network: expectile regression on Q(s, a_data)
     with torch.no_grad():
         q_data = q_net(states, actions).squeeze(-1)
     v_pred = v_net(states).squeeze(-1)
     diff = q_data - v_pred
-    # L_V = E[|tau - 1(diff < 0)| * diff^2]
     weight = torch.where(diff > 0, tau, 1.0 - tau)
     v_loss = (weight * (diff ** 2)).mean()
 
@@ -65,14 +57,13 @@ def iql_update(q_net, q_opt, v_net, v_opt, pi_net, pi_opt,
     torch.nn.utils.clip_grad_norm_(v_net.parameters(), 1.0)
     v_opt.step()
 
-    # 3) Policy: advantage-weighted regression
     with torch.no_grad():
         advantage = q_net(states, actions).squeeze(-1) - v_net(states).squeeze(-1)
         exp_adv = torch.exp(beta * advantage)
         exp_adv = torch.clamp(exp_adv, max=100.0)
 
     log_prob = pi_net.log_prob(states, actions).squeeze(-1)
-    log_prob = torch.clamp(log_prob, min=-100.0)  # Prevent explosion after EMA fusion
+    log_prob = torch.clamp(log_prob, min=-100.0)
     pi_loss = -(exp_adv * log_prob).mean()
 
     pi_opt.zero_grad()
@@ -84,7 +75,6 @@ def iql_update(q_net, q_opt, v_net, v_opt, pi_net, pi_opt,
 
 
 def ema_fuse(sd_labeled, sd_relabeled, alpha):
-    """EMA fusion: omega_t = alpha * omega_{t-1} + (1-alpha) * sigma_t."""
     fused = {}
     for key in sd_labeled:
         fused[key] = alpha * sd_labeled[key] + (1 - alpha) * sd_relabeled[key]
@@ -120,7 +110,6 @@ def train_iql_ema(task, gpu_id, seed=42):
 
     SD, AD, HS = C.IQL_STATE_DIM, C.IQL_ACTION_DIM, C.IQL_HIDDEN_SIZE
 
-    # Policy 1: pi_labeled (trained on D_L)
     q1 = QNetwork(SD, AD, HS).to(device)
     v1 = ValueNetwork(SD, HS).to(device)
     pi1 = PolicyNetwork(SD, AD, HS).to(device)
@@ -128,7 +117,6 @@ def train_iql_ema(task, gpu_id, seed=42):
     v1_opt = optim.Adam(v1.parameters(), lr=C.IQL_LR)
     pi1_opt = optim.Adam(pi1.parameters(), lr=C.IQL_LR)
 
-    # Policy 2: pi_relabeled (trained on D_relabeled)
     q2 = QNetwork(SD, AD, HS).to(device)
     v2 = ValueNetwork(SD, HS).to(device)
     pi2 = PolicyNetwork(SD, AD, HS).to(device)
@@ -142,7 +130,6 @@ def train_iql_ema(task, gpu_id, seed=42):
     history = {k: [] for k in ["q1", "v1", "pi1", "q2", "v2", "pi2"]}
 
     for epoch in range(1, C.IQL_EPOCHS + 1):
-        # Train pi_labeled on D_L
         losses1 = []
         for batch in loader_labeled:
             batch = [x.to(device) for x in batch]
@@ -150,7 +137,6 @@ def train_iql_ema(task, gpu_id, seed=42):
                            batch, C.IQL_GAMMA, C.IQL_TAU, C.IQL_BETA)
             losses1.append(l)
 
-        # Train pi_relabeled on D_relabeled
         losses2 = []
         for batch in loader_relabeled:
             batch = [x.to(device) for x in batch]
@@ -167,16 +153,8 @@ def train_iql_ema(task, gpu_id, seed=42):
         history["v2"].append(avg2["v_loss"])
         history["pi2"].append(avg2["pi_loss"])
 
-        # Adaptive Knowledge Fusion: EMA every eta epochs
         if epoch % C.EMA_ETA == 0:
-            q_fused = ema_fuse(q1.state_dict(), q2.state_dict(), C.EMA_ALPHA)
-            v_fused = ema_fuse(v1.state_dict(), v2.state_dict(), C.EMA_ALPHA)
-            pi_fused = ema_fuse(pi1.state_dict(), pi2.state_dict(), C.EMA_ALPHA)
-
-            q1.load_state_dict(q_fused)
-            v1.load_state_dict(v_fused)
-            pi1.load_state_dict(pi_fused)
-            # Note: only pi_labeled is updated via EMA. pi_relabeled continues independently.
+            pi1.load_state_dict(ema_fuse(pi1.state_dict(), pi2.state_dict(), C.EMA_ALPHA))
 
         if epoch % 50 == 0:
             logger.info(f"Epoch {epoch}/{C.IQL_EPOCHS} | "
