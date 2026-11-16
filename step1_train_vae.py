@@ -1,4 +1,3 @@
-"""Step 1: Train VAE for Urban State Compression."""
 import os
 import sys
 import pickle
@@ -18,7 +17,6 @@ class StateDataset(Dataset):
     def __init__(self, data_path):
         with open(data_path, 'rb') as f:
             raw = pickle.load(f)
-        # AE buffer rows have no reward column: [S(125), A(1), S'(125)] = 251 dims
         data = np.array(raw, dtype=np.float32)
         S = data[:, :125]
         S_prime = data[:, 126:251]
@@ -47,7 +45,6 @@ def train_vae(gpu_id=0, seed=42):
     loader = DataLoader(dataset, batch_size=C.VAE_BATCH_SIZE, shuffle=True)
     logger.info(f"Dataset size: {len(dataset)}")
 
-    # Save scaler for later use
     joblib.dump(dataset.scaler, os.path.join(out_dir, "state_scaler.pkl"))
 
     model = VAE(C.VAE_INPUT_DIM, C.VAE_HIDDEN_DIM, C.VAE_LATENT_DIM).to(device)
