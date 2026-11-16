@@ -64,7 +64,7 @@ def insert_predicted_rewards(ensemble, trajectory, device):
 
 
 def train_step(mae, ensemble, labeled_batch, unlabeled_batch, mae_opt, ensemble_opt,
-               mask_ratio, device):
+               mask_ratio, device, use_trajmae=True):
     mae.train()
     ensemble.train()
     mae_opt.zero_grad()
@@ -79,13 +79,15 @@ def train_step(mae, ensemble, labeled_batch, unlabeled_batch, mae_opt, ensemble_
         sa = torch.cat([to_tensor(states, device), to_tensor(actions, device),
                         to_tensor(next_states, device)], dim=1)
         reward_losses.append(ensemble.individual_losses(sa, to_tensor(rewards, device)))
-        labeled_recon.append(reconstruction_loss(mae, trajectory, mask_ratio, device))
+        if use_trajmae:
+            labeled_recon.append(reconstruction_loss(mae, trajectory, mask_ratio, device))
 
-    for trajectory in unlabeled_batch:
-        augmented_traj = insert_predicted_rewards(ensemble, trajectory, device)
-        if augmented_traj is None:
-            continue
-        unlabeled_recon.append(reconstruction_loss(mae, augmented_traj, mask_ratio, device))
+    if use_trajmae:
+        for trajectory in unlabeled_batch:
+            augmented_traj = insert_predicted_rewards(ensemble, trajectory, device)
+            if augmented_traj is None:
+                continue
+            unlabeled_recon.append(reconstruction_loss(mae, augmented_traj, mask_ratio, device))
 
     terms = [torch.stack(losses).mean()
              for losses in (reward_losses, labeled_recon, unlabeled_recon) if losses]
@@ -100,7 +102,7 @@ def train_step(mae, ensemble, labeled_batch, unlabeled_batch, mae_opt, ensemble_
     return avg(reward_losses), avg(labeled_recon), avg(unlabeled_recon)
 
 
-def train_semi_mae(task, gpu_id, seed=42):
+def train_semi_mae(task, gpu_id, seed=42, use_trajmae=True):
     set_seed(seed)
     device = get_device(gpu_id)
 
@@ -141,7 +143,8 @@ def train_semi_mae(task, gpu_id, seed=42):
 
     labeled_iter = cycle(labeled_loader)
     steps_per_epoch = len(unlabeled_loader) if unlabeled_loader is not None else len(labeled_loader)
-    logger.info(f"Steps per epoch: {steps_per_epoch}, mask ratio: {C.MAE_MASK_RATIO}")
+    logger.info(f"Steps per epoch: {steps_per_epoch}, mask ratio: {C.MAE_MASK_RATIO}, "
+                f"TrajMAE: {'on' if use_trajmae else 'off'}")
 
     history = {"reward_loss": [], "labeled_mae": [], "unlabeled_mae": []}
 
@@ -151,7 +154,8 @@ def train_semi_mae(task, gpu_id, seed=42):
         for unlabeled_batch in unlabeled_batches:
             labeled_batch = next(labeled_iter)
             rl, ml, ul = train_step(mae, ensemble, labeled_batch, unlabeled_batch,
-                                    mae_opt, ensemble_opt, C.MAE_MASK_RATIO, device)
+                                    mae_opt, ensemble_opt, C.MAE_MASK_RATIO, device,
+                                    use_trajmae)
             rl_total += rl
             ml_total += ml
             ul_total += ul
@@ -169,10 +173,12 @@ def train_semi_mae(task, gpu_id, seed=42):
                         f"L_MAE={ml_avg:.4f} U_MAE={ul_avg:.4f}")
 
         if epoch % 200 == 0:
-            torch.save(mae.state_dict(), os.path.join(out_dir, f"mae_epoch{epoch}.pth"))
+            if use_trajmae:
+                torch.save(mae.state_dict(), os.path.join(out_dir, f"mae_epoch{epoch}.pth"))
             torch.save(ensemble.state_dict(), os.path.join(out_dir, f"ensemble_epoch{epoch}.pth"))
 
-    torch.save(mae.state_dict(), os.path.join(out_dir, "mae_final.pth"))
+    if use_trajmae:
+        torch.save(mae.state_dict(), os.path.join(out_dir, "mae_final.pth"))
     torch.save(ensemble.state_dict(), os.path.join(out_dir, "ensemble_final.pth"))
 
     save_metrics(history, os.path.join(out_dir, "training_history.json"))
@@ -187,5 +193,6 @@ if __name__ == "__main__":
     parser.add_argument("--task", required=True)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no_trajmae", action="store_true")
     args = parser.parse_args()
-    train_semi_mae(args.task, args.gpu, args.seed)
+    train_semi_mae(args.task, args.gpu, args.seed, use_trajmae=not args.no_trajmae)
