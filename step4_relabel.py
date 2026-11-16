@@ -1,4 +1,3 @@
-"""Step 4: Relabel unlabeled transitions using trained reward ensemble."""
 import os
 import sys
 import pickle
@@ -18,21 +17,18 @@ def relabel(task, gpu_id=0):
     os.makedirs(out_dir, exist_ok=True)
     logger = setup_logging(out_dir, "relabel")
 
-    # Load VAE encoder
     vae_dir = os.path.join(C.OUTPUT_DIR, "vae")
     vae = VAE(C.VAE_INPUT_DIM, C.VAE_HIDDEN_DIM, C.VAE_LATENT_DIM).to(device)
     vae.load_state_dict(torch.load(os.path.join(vae_dir, "vae_best.pth"), map_location=device))
     vae.eval()
     scaler = joblib.load(os.path.join(vae_dir, "state_scaler.pkl"))
 
-    # Load ensemble
     ensemble_path = os.path.join(out_dir, "semi_mae", "ensemble_final.pth")
     ensemble = RewardEnsemble(C.ENSEMBLE_N_MODELS, C.ENSEMBLE_INPUT_DIM,
                                C.ENSEMBLE_HIDDEN_DIM).to(device)
     ensemble.load_state_dict(torch.load(ensemble_path, map_location=device))
     ensemble.eval()
 
-    # Load unlabeled transitions (252-dim: S125 + A1 + R1 + S'125)
     paths = C.get_data_paths(task)
     with open(paths["unlabeled_transitions"], 'rb') as f:
         transitions = pickle.load(f)
@@ -58,10 +54,9 @@ def relabel(task, gpu_id=0):
             s_lat = vae.encode_deterministic(s_batch)
             sp_lat = vae.encode_deterministic(sp_batch)
 
-            sa = torch.cat([s_lat, a_batch, sp_lat], dim=1)  # [B, 21]
-            pred_r = ensemble(sa)  # [B, 1]
+            sa = torch.cat([s_lat, a_batch, sp_lat], dim=1)
+            pred_r = ensemble(sa)
 
-            # Build relabeled transitions: [s_lat(10), a(1), r_pred(1), s'_lat(10)] = 22 dims
             batch_relabeled = torch.cat([s_lat, a_batch, pred_r, sp_lat], dim=1)
             relabeled.append(batch_relabeled.cpu().numpy())
 
