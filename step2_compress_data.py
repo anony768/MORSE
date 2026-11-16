@@ -1,4 +1,3 @@
-"""Step 2: Compress all data using trained VAE encoder."""
 import os
 import sys
 import pickle
@@ -13,7 +12,6 @@ from utils import get_device, setup_logging
 
 
 def compress_transitions(data_path, vae, scaler, device, output_path):
-    """Compress transition data [S(125),A,R,S'(125)] -> [s(10),A,R,s'(10)]."""
     with open(data_path, 'rb') as f:
         transitions = pickle.load(f)
     data = np.array(transitions, dtype=np.float32)
@@ -41,14 +39,13 @@ def compress_transitions(data_path, vae, scaler, device, output_path):
     S_lat = np.concatenate(s_latent_list, axis=0)
     SP_lat = np.concatenate(sp_latent_list, axis=0)
 
-    compressed = np.concatenate([S_lat, A, R, SP_lat], axis=1)  # [N, 22]
+    compressed = np.concatenate([S_lat, A, R, SP_lat], axis=1)
     with open(output_path, 'wb') as f:
         pickle.dump(compressed.tolist(), f)
     print(f"Compressed {n} transitions -> {output_path} (dim={compressed.shape[1]})")
 
 
 def compress_trajectories(data_path, vae, scaler, device, output_path):
-    """Compress trajectory data: replace 125-dim states with 10-dim latent."""
     with open(data_path, 'rb') as f:
         trajectories = pickle.load(f)
 
@@ -67,7 +64,7 @@ def compress_trajectories(data_path, vae, scaler, device, output_path):
                         ).cpu().numpy().flatten().tolist()
                     new_traj.append((s_lat, t))
                 else:
-                    new_traj.append((val, t))  # already compressed
+                    new_traj.append((val, t))
             else:
                 new_traj.append((val, t))
         compressed_trajs.append(new_traj)
