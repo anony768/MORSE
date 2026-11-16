@@ -1,9 +1,3 @@
-"""Build each task's training files from sample_data/trajectories.json.gz.
-
-The sample holds a few real trajectories per driver. For a target driver, its own
-trajectories are the labeled data and the other drivers' trajectories, with rewards
-removed (R = -1), are the unlabeled data.
-"""
 import gzip
 import json
 import os
@@ -12,11 +6,10 @@ import pickle
 import config as C
 from models import extract_transitions_from_trajectory
 
-SAMPLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_data", "trajectories.json.gz")
+SAMPLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trajectories.json.gz")
 
 
 def to_rows(trajectories):
-    """Flatten trajectories to rows [S(125), A, R, S'(125)]."""
     rows = []
     for traj in trajectories:
         for s, a, sp, r in zip(*extract_transitions_from_trajectory(traj)):
@@ -39,7 +32,6 @@ def main():
         data = json.load(f)
 
     all_trajs = [t for trajs in data.values() for t in trajs]
-    # VAE rows have no reward column: [S(125), A, S'(125)]
     dump([row[:126] + row[127:] for row in to_rows(all_trajs)], C.AE_DATA)
 
     for key, labeled in data.items():
